@@ -10,7 +10,91 @@ use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerC
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
+
+const FAILURE_VERIFICATION_TTL_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestMode {
+    Streaming,
+    NonStreaming,
+}
+
+impl RequestMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Streaming => "流式",
+            Self::NonStreaming => "非流式",
+        }
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Streaming => Self::NonStreaming,
+            Self::NonStreaming => Self::Streaming,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FailureVerification {
+    confirmed_unhealthy: bool,
+    streaming_failures: u32,
+    non_streaming_failures: u32,
+    last_updated_at: Option<Instant>,
+}
+
+impl FailureVerification {
+    fn note_failure(&mut self, request_mode: RequestMode) -> bool {
+        let now = Instant::now();
+
+        if self
+            .last_updated_at
+            .is_some_and(|last| now.duration_since(last).as_secs() > FAILURE_VERIFICATION_TTL_SECS)
+        {
+            *self = Self::default();
+        }
+
+        self.last_updated_at = Some(now);
+
+        let same_mode_failures = {
+            let same_mode_failures = self.mode_failures_mut(request_mode);
+            *same_mode_failures += 1;
+            *same_mode_failures
+        };
+
+        if self.confirmed_unhealthy {
+            return true;
+        }
+
+        let opposite_mode_failures = self.mode_failures(request_mode.opposite());
+        if same_mode_failures >= 2 || opposite_mode_failures > 0 {
+            self.confirmed_unhealthy = true;
+            return true;
+        }
+
+        false
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn mode_failures(&self, request_mode: RequestMode) -> u32 {
+        match request_mode {
+            RequestMode::Streaming => self.streaming_failures,
+            RequestMode::NonStreaming => self.non_streaming_failures,
+        }
+    }
+
+    fn mode_failures_mut(&mut self, request_mode: RequestMode) -> &mut u32 {
+        match request_mode {
+            RequestMode::Streaming => &mut self.streaming_failures,
+            RequestMode::NonStreaming => &mut self.non_streaming_failures,
+        }
+    }
+}
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -18,6 +102,8 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// Provider 失败确认缓存：避免单次单模式失败直接计入熔断
+    failure_verifications: Arc<RwLock<HashMap<String, FailureVerification>>>,
 }
 
 impl ProviderRouter {
@@ -26,6 +112,7 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            failure_verifications: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -128,6 +215,7 @@ impl ProviderRouter {
         provider_id: &str,
         app_type: &str,
         used_half_open_permit: bool,
+        request_mode: RequestMode,
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
@@ -142,8 +230,25 @@ impl ProviderRouter {
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
 
         if success {
+            self.clear_failure_verification(&circuit_key).await;
             breaker.record_success(used_half_open_permit).await;
         } else {
+            let should_record_failure = if used_half_open_permit {
+                // HalfOpen 探测失败必须立即回到 Open，不能继续延迟确认。
+                self.clear_failure_verification(&circuit_key).await;
+                true
+            } else {
+                self.should_record_failure(&circuit_key, request_mode).await
+            };
+
+            if !should_record_failure {
+                log::info!(
+                    "[{app_type}] [CB-VERIFY] Provider {provider_id} 首次{}失败仅进入观察，不计入熔断",
+                    request_mode.label()
+                );
+                return Ok(());
+            }
+
             breaker.record_failure(used_half_open_permit).await;
         }
 
@@ -167,6 +272,7 @@ impl ProviderRouter {
         if let Some(breaker) = breakers.get(circuit_key) {
             breaker.reset().await;
         }
+        self.clear_failure_verification(circuit_key).await;
     }
 
     /// 重置指定供应商的熔断器
@@ -255,6 +361,20 @@ impl ProviderRouter {
         breakers.insert(key.to_string(), breaker.clone());
 
         breaker
+    }
+
+    async fn should_record_failure(&self, circuit_key: &str, request_mode: RequestMode) -> bool {
+        let mut verifications = self.failure_verifications.write().await;
+        let verification = verifications.entry(circuit_key.to_string()).or_default();
+        verification.note_failure(request_mode)
+    }
+
+    async fn clear_failure_verification(&self, circuit_key: &str) {
+        let mut verifications = self.failure_verifications.write().await;
+        if let Some(verification) = verifications.get_mut(circuit_key) {
+            verification.reset();
+        }
+        verifications.remove(circuit_key);
     }
 }
 
@@ -438,7 +558,14 @@ mod tests {
         let router = ProviderRouter::new(db.clone());
 
         router
-            .record_result("b", "claude", false, false, Some("fail".to_string()))
+            .record_result(
+                "b",
+                "claude",
+                false,
+                RequestMode::NonStreaming,
+                false,
+                Some("fail".to_string()),
+            )
             .await
             .unwrap();
 
@@ -477,7 +604,25 @@ mod tests {
 
         // 触发熔断：1 次失败
         router
-            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .record_result(
+                "a",
+                "claude",
+                false,
+                RequestMode::NonStreaming,
+                false,
+                Some("fail".to_string()),
+            )
+            .await
+            .unwrap();
+        router
+            .record_result(
+                "a",
+                "claude",
+                false,
+                RequestMode::NonStreaming,
+                false,
+                Some("fail".to_string()),
+            )
             .await
             .unwrap();
 
@@ -499,5 +644,126 @@ mod tests {
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_first_single_mode_failure_is_deferred() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let provider =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider).unwrap();
+        let router = ProviderRouter::new(db);
+
+        router
+            .record_result(
+                "a",
+                "claude",
+                false,
+                RequestMode::Streaming,
+                false,
+                Some("stream fail".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let permit = router.allow_provider_request("a", "claude").await;
+        assert!(permit.allowed);
+        assert!(!permit.used_half_open_permit);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_cross_mode_failure_confirms_breaker() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let provider =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider).unwrap();
+
+        let router = ProviderRouter::new(db);
+
+        router
+            .record_result(
+                "a",
+                "claude",
+                false,
+                RequestMode::Streaming,
+                false,
+                Some("stream fail".to_string()),
+            )
+            .await
+            .unwrap();
+
+        router
+            .record_result(
+                "a",
+                "claude",
+                false,
+                RequestMode::NonStreaming,
+                false,
+                Some("non-stream fail".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let permit = router.allow_provider_request("a", "claude").await;
+        assert!(!permit.allowed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_second_same_mode_failure_confirms_breaker() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let provider =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider).unwrap();
+
+        let router = ProviderRouter::new(db);
+
+        router
+            .record_result(
+                "a",
+                "claude",
+                false,
+                RequestMode::Streaming,
+                false,
+                Some("stream fail".to_string()),
+            )
+            .await
+            .unwrap();
+
+        router
+            .record_result(
+                "a",
+                "claude",
+                false,
+                RequestMode::Streaming,
+                false,
+                Some("stream fail again".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let permit = router.allow_provider_request("a", "claude").await;
+        assert!(!permit.allowed);
     }
 }

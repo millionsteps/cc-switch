@@ -7,7 +7,7 @@ use super::{
     error::*,
     failover_switch::FailoverSwitchManager,
     log_codes::fwd as log_fwd,
-    provider_router::ProviderRouter,
+    provider_router::{ProviderRouter, RequestMode},
     providers::{get_adapter, ProviderAdapter, ProviderType},
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
@@ -146,6 +146,7 @@ impl RequestForwarder {
         endpoint: &str,
         body: Value,
         headers: axum::http::HeaderMap,
+        request_mode: RequestMode,
         providers: Vec<Provider>,
     ) -> Result<ForwardResult, ForwardError> {
         // 获取适配器
@@ -234,6 +235,7 @@ impl RequestForwarder {
                             &provider.id,
                             app_type_str,
                             used_half_open_permit,
+                            request_mode,
                             true,
                             None,
                         )
@@ -363,6 +365,7 @@ impl RequestForwarder {
                                                 &provider.id,
                                                 app_type_str,
                                                 used_half_open_permit,
+                                                request_mode,
                                                 true,
                                                 None,
                                             )
@@ -422,14 +425,8 @@ impl RequestForwarder {
                                         );
 
                                         // 区分错误类型：Provider 问题记录失败，客户端问题仅释放 permit
-                                        let is_provider_error = match &retry_err {
-                                            ProxyError::Timeout(_)
-                                            | ProxyError::ForwardFailed(_) => true,
-                                            ProxyError::UpstreamError { status, .. } => {
-                                                *status >= 500
-                                            }
-                                            _ => false,
-                                        };
+                                        let is_provider_error =
+                                            self.should_record_provider_failure(&retry_err);
 
                                         if is_provider_error {
                                             // Provider 问题：记录失败到熔断器
@@ -439,6 +436,7 @@ impl RequestForwarder {
                                                     &provider.id,
                                                     app_type_str,
                                                     used_half_open_permit,
+                                                    request_mode,
                                                     false,
                                                     Some(retry_err.to_string()),
                                                 )
@@ -559,6 +557,7 @@ impl RequestForwarder {
                                             &provider.id,
                                             app_type_str,
                                             used_half_open_permit,
+                                            request_mode,
                                             true,
                                             None,
                                         )
@@ -610,13 +609,8 @@ impl RequestForwarder {
                                         "[{app_type_str}] [RECT-012] budget 整流重试仍失败: {retry_err}"
                                     );
 
-                                    let is_provider_error = match &retry_err {
-                                        ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => {
-                                            true
-                                        }
-                                        ProxyError::UpstreamError { status, .. } => *status >= 500,
-                                        _ => false,
-                                    };
+                                    let is_provider_error =
+                                        self.should_record_provider_failure(&retry_err);
 
                                     if is_provider_error {
                                         let _ = self
@@ -625,6 +619,7 @@ impl RequestForwarder {
                                                 &provider.id,
                                                 app_type_str,
                                                 used_half_open_permit,
+                                                request_mode,
                                                 false,
                                                 Some(retry_err.to_string()),
                                             )
@@ -679,16 +674,27 @@ impl RequestForwarder {
                     }
 
                     // 失败：记录失败并更新熔断器
-                    let _ = self
-                        .router
-                        .record_result(
-                            &provider.id,
-                            app_type_str,
-                            used_half_open_permit,
-                            false,
-                            Some(e.to_string()),
-                        )
-                        .await;
+                    if self.should_record_provider_failure(&e) {
+                        let _ = self
+                            .router
+                            .record_result(
+                                &provider.id,
+                                app_type_str,
+                                used_half_open_permit,
+                                request_mode,
+                                false,
+                                Some(e.to_string()),
+                            )
+                            .await;
+                    } else {
+                        self.router
+                            .release_permit_neutral(
+                                &provider.id,
+                                app_type_str,
+                                used_half_open_permit,
+                            )
+                            .await;
+                    }
 
                     // 分类错误
                     let category = self.categorize_proxy_error(&e);
@@ -965,6 +971,18 @@ impl RequestForwarder {
             ProxyError::NoAvailableProvider => ErrorCategory::NonRetryable,
             // 其他错误（数据库/内部错误等）：不是换供应商能解决的问题
             _ => ErrorCategory::NonRetryable,
+        }
+    }
+
+    fn should_record_provider_failure(&self, error: &ProxyError) -> bool {
+        match error {
+            ProxyError::Timeout(_)
+            | ProxyError::ForwardFailed(_)
+            | ProxyError::StreamIdleTimeout(_) => true,
+            ProxyError::UpstreamError { status, .. } => {
+                *status == 408 || *status == 429 || *status >= 500
+            }
+            _ => false,
         }
     }
 }

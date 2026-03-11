@@ -13,6 +13,7 @@ use super::{
         CLAUDE_PARSER_CONFIG, CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
+    provider_router::RequestMode,
     providers::{
         get_adapter, get_claude_api_format, streaming::create_anthropic_sse_stream,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
@@ -80,6 +81,11 @@ pub async fn handle_messages(
             "/v1/messages",
             body.clone(),
             headers,
+            if is_stream {
+                RequestMode::Streaming
+            } else {
+                RequestMode::NonStreaming
+            },
             ctx.get_providers(),
         )
         .await
@@ -305,6 +311,11 @@ pub async fn handle_chat_completions(
             "/chat/completions",
             body,
             headers,
+            if is_stream {
+                RequestMode::Streaming
+            } else {
+                RequestMode::NonStreaming
+            },
             ctx.get_providers(),
         )
         .await
@@ -346,6 +357,11 @@ pub async fn handle_responses(
             "/responses",
             body,
             headers,
+            if is_stream {
+                RequestMode::Streaming
+            } else {
+                RequestMode::NonStreaming
+            },
             ctx.get_providers(),
         )
         .await
@@ -387,6 +403,11 @@ pub async fn handle_responses_compact(
             "/responses/compact",
             body,
             headers,
+            if is_stream {
+                RequestMode::Streaming
+            } else {
+                RequestMode::NonStreaming
+            },
             ctx.get_providers(),
         )
         .await
@@ -441,6 +462,11 @@ pub async fn handle_gemini(
             endpoint,
             body,
             headers,
+            if is_stream {
+                RequestMode::Streaming
+            } else {
+                RequestMode::NonStreaming
+            },
             ctx.get_providers(),
         )
         .await
