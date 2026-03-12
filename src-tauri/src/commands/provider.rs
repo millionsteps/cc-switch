@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use tauri::State;
+use tauri::{async_runtime, State};
 
 use crate::app_config::AppType;
 use crate::error::AppError;
@@ -9,6 +9,13 @@ use crate::services::{
 };
 use crate::store::AppState;
 use std::str::FromStr;
+
+fn clone_app_state(state: &AppState) -> AppState {
+    AppState {
+        db: state.db.clone(),
+        proxy_service: state.proxy_service.clone(),
+    }
+}
 
 #[tauri::command]
 pub fn get_providers(
@@ -36,13 +43,17 @@ pub fn add_provider(
 }
 
 #[tauri::command]
-pub fn update_provider(
+pub async fn update_provider(
     state: State<'_, AppState>,
     app: String,
     provider: Provider,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::update(state.inner(), app_type, provider).map_err(|e| e.to_string())
+    let state = clone_app_state(state.inner());
+    async_runtime::spawn_blocking(move || ProviderService::update(&state, app_type, provider))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -77,6 +88,18 @@ fn switch_provider_internal(
     ProviderService::switch(state, app_type, id)
 }
 
+pub async fn switch_provider_internal_async(
+    state: &AppState,
+    app_type: AppType,
+    id: &str,
+) -> Result<SwitchResult, AppError> {
+    let state = clone_app_state(state);
+    let id = id.to_string();
+    async_runtime::spawn_blocking(move || switch_provider_internal(&state, app_type, &id))
+        .await
+        .map_err(|e| AppError::Message(e.to_string()))?
+}
+
 #[cfg_attr(not(feature = "test-hooks"), doc(hidden))]
 pub fn switch_provider_test_hook(
     state: &AppState,
@@ -87,13 +110,15 @@ pub fn switch_provider_test_hook(
 }
 
 #[tauri::command]
-pub fn switch_provider(
+pub async fn switch_provider(
     state: State<'_, AppState>,
     app: String,
     id: String,
 ) -> Result<SwitchResult, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    switch_provider_internal(&state, app_type, &id).map_err(|e| e.to_string())
+    switch_provider_internal_async(state.inner(), app_type, &id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn import_default_config_internal(state: &AppState, app_type: AppType) -> Result<bool, AppError> {
